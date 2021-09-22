@@ -2,13 +2,15 @@
 
 import argparse
 import netCDF4
-from numba import jit
 import numpy
 import os
 import pickle
 import scipy.sparse
 import sys
 import time
+
+import regrid_tools as tools
+from pykdtree.kdtree import KDTree
 
 def parseCommandLine():
   """
@@ -80,9 +82,10 @@ def main(args):
   ocn_lat = netCDF4.Dataset(args.hgrid_file).variables['y'][:][1::2,1::2]  # Cell-center latitudes (cell centers)
   ocn_area = netCDF4.Dataset(args.hgrid_file).variables['area'][:]      # Super-grid cell areas
   ocn_area = ( ocn_area[::2,::2] + ocn_area[1::2,1::2] ) + ( ocn_area[1::2,::2] + ocn_area[::2,1::2] ) # Ocean-grid cell areas
-  ocn_mask = netCDF4.Dataset(args.mask_file).variables[args.mask_var][:] # 1=ocean, 0=land
+  ocn_mask = netCDF4.Dataset(args.mask_file).variables[args.mask_var][:].astype(int) # 1=ocean, 0=land
   ocn_nj, ocn_ni = ocn_mask.shape
   ocn_id = numpy.arange( ocn_nj*ocn_ni ).reshape(ocn_mask.shape)
+  ocn_qlon_bnds = ocn_qlon.min(), ocn_qlon.max()
   if args.progress: end_info(tic)
 
   if not args.quiet: print('Ocean grid shape is %i x %i.'%(ocn_nj, ocn_ni))
@@ -92,10 +95,19 @@ def main(args):
   runoff_file = netCDF4.Dataset(args.runoff_file)
   rvr_nj, rvr_ni = runoff_file.variables[args.runoff_var].shape[-2:]
   rvr_res = 360.0/rvr_ni
+
+  # make rvr_lon  fit the same bounds as ocn
   rvr_lon = numpy.arange(0.5*rvr_res, 360., rvr_res)
+  rvr_lon = numpy.where(rvr_lon < ocn_qlon_bnds[0], rvr_lon + 360, rvr_lon)
+  rvr_lon = numpy.where(rvr_lon > ocn_qlon_bnds[1], rvr_lon - 360, rvr_lon)
   rvr_lat = numpy.arange(-90.+0.5*rvr_res, 90., rvr_res)
+
+  # meshgrid as a list of 2d points (for constructing kdtree
+  rvr_mesh = numpy.dstack(numpy.meshgrid(rvr_lat, rvr_lon)).reshape(-1, 2)
+
   rvr_qlon = numpy.arange(0, 360.0001, rvr_res)
   rvr_qlat = numpy.arange(-90., 90.001, rvr_res)
+
   rvr_nj, rvr_ni = rvr_lat.size, rvr_lon.size
   rvr_id = numpy.arange(rvr_nj*rvr_ni,dtype=numpy.int32) # River grid cell id
   if 'area' in runoff_file.variables:
@@ -148,18 +160,7 @@ def main(args):
 
     # Calculate a coastal mask
     if args.progress: tic = info('Calculating a coastal mask')
-    cst_mask = 0 * ocn_mask # All land should be 0
-    cst_mask[ (ocn_mask>0) & (numpy.roll(ocn_mask,1,axis=1)==0) ] = 1 # Land to the west
-    cst_mask[ (ocn_mask>0) & (numpy.roll(ocn_mask,-1,axis=1)==0) ] = 1 # Land to the east
-    cst_mask[ (ocn_mask>0) & (numpy.roll(ocn_mask,1,axis=0)==0) ] = 1 # Land to the south
-    #cst_mask[ (ocn_mask>0) & (numpy.roll(numpy.roll(ocn_mask,1,axis=0),1,axis=1)==0) ] = 1 # Land to the south-west
-    #cst_mask[ (ocn_mask>0) & (numpy.roll(numpy.roll(ocn_mask,1,axis=0),-1,axis=1)==0) ] = 1 # Land to the south-east
-    nom = numpy.roll(ocn_mask,-1,axis=0) # Shift southward
-    nom[-1,:] = ocn_mask[-1,::-1] # Tri-polar fold
-    cst_mask[ (ocn_mask>0) & (nom==0) ] = 1 # Land to the north
-    #cst_mask[ (ocn_mask>0) & (numpy.roll(nom,1,axis=1)==0) ] = 1 # Land to the north-west
-    #cst_mask[ (ocn_mask>0) & (numpy.roll(nom,-1,axis=1)==0) ] = 1 # Land to the north-east
-    del nom # Clean up
+    cst_mask = tools.coast_mask(ocn_mask)
     if args.progress: end_info(tic)
 
     if not args.quiet:
@@ -168,44 +169,27 @@ def main(args):
     # Calculate nearest coastal cell
     if not args.skip_coast:
       if args.progress: tic = info('Calculating nearest coastal cell on ocean grid (should take ~%.1fs)'%(6*ocn_mask.size/(1080*1440)))
-      cst_nrst_ocn_id = nearest_coastal_cell( ocn_id, cst_mask )
+      cst_nrst_ocn_id = tools.nearest_coastal_cell( ocn_id, cst_mask )
       if args.progress: end_info(tic)
 
     # Build k-d tree for ocean grid
     if args.progress: tic = info('Building k-d tree for ocean grid (should take ~%.1fs)'%(210*ocn_mask.size/(1080*1440)))
-    ocn_kdtree = kdtree(ocn_qlat, ocn_qlon)
+    ocn_kdtree = KDTree(numpy.stack((ocn_qlat.flatten(), ocn_qlon.flatten()), axis=1))
     if args.progress: end_info(tic)
 
     # Find ocean cells corresponding to river cells
     if args.progress: tic = info('Using k-d tree to find ocean cells for each river cell (should take ~%.1fs)'%(40*ocn_mask.size/(1080*1440)))
-    rvr_oid = -numpy.ones((rvr_nj,rvr_ni),dtype=numpy.int32)
-    for rid in rvr_id[ (rvr_oid<0).flatten() ]:
-      j, i = ocn_kdtree.find_cell( rvr_lat[int(rid/rvr_ni)], rvr_lon[rid%rvr_ni] )
-      if j is None: j, i = ocn_kdtree.find_cell( rvr_lat[int(rid/rvr_ni)], rvr_lon[rid%rvr_ni]-360. )
-      if j is None: j, i = ocn_kdtree.find_cell( rvr_lat[int(rid/rvr_ni)], rvr_lon[rid%rvr_ni]+360. )
-      if j is not None: rvr_oid[int(rid/rvr_ni),rid%rvr_ni] = j * ocn_ni + i
-    del i, j, rid
-    if args.progress: end_info(tic)
-
-    if not args.quiet:
-      print('%i/%i river cells without associated ocean id (first pass).'%((rvr_oid<0).sum(),rvr_oid.size))
-   
-    if args.progress: tic = info('Filling in remaining river cells by brute force (should take ~%.1fs)'%(120*ocn_mask.size/(1080*1440)))
-    for rid in rvr_id[ (rvr_oid.flatten()<0) ]:
-      rj, ri = int(rid/rvr_ni), rid%rvr_ni
-      oid = brute_force_search_for_ocn_ij( ocn_lat, ocn_lon, rvr_lat[rj], rvr_lon[ri])
-      rvr_oid[rj, ri] = oid
-    del ri, rj, oid, rid
+    rvr_oid = ocn_kdtree.query(rvr_mesh)[1].reshape(rvr_nj, rvr_ni)
     if args.progress: end_info(tic)
 
     if not args.quiet:
       print('%i/%i river cells without associated ocean id.'%((rvr_oid<0).sum(),rvr_oid.size))
-   
+
     # Construct sparse matrices
     if args.progress: tic = info('Constructing regridding matrix for river cells with many ocean cells')
     Arow = scipy.sparse.lil_matrix( (ocn_nj*ocn_ni, rvr_nj*rvr_ni), dtype=numpy.double )
-    rids = rvr_id[rvr_ocells_in_rcells<=1]
-    oids = rvr_oid.flatten()[rids] # debug without coastal mapping
+    rids = rvr_id[rvr_ocells_in_rcells<=1].astype(numpy.int64)
+    oids = rvr_oid.flatten()[rids].astype(numpy.int64)
     Arow[oids,rids] = rvr_area.flatten()[rids]
     del rids, oids
     if args.progress: end_info(tic)
@@ -254,121 +238,6 @@ def main(args):
     for n in range(totals.shape[0]):
       err = abs( totals[n,0] - totals[n,1] ) / totals[n,0]
       print('Record %i, net source = %f kg/s, net regridded = %f kg/s, fractional error = %g'%(n,totals[n,0],totals[n,1],err))
-
-def nearest_coastal_cell( ocn_id, cst_mask ):
-  cst_nrst_ocn_id = ocn_id * cst_mask - (1 - cst_mask) # Will have nearest oid of coastal cells (-1 for unassigned)
-  ocidm = 1 * cst_mask # Mask for assigned field
-  while (cst_nrst_ocn_id<0).sum()>0:
-    # Look east
-    difm = numpy.roll( ocidm, -1, axis=1) - ocidm
-    cst_nrst_ocn_id[ difm>0 ] = numpy.roll( cst_nrst_ocn_id, -1, axis=1)[ difm>0 ]
-    ocidm[ cst_nrst_ocn_id>=0 ] = 1 # Flag all that have been assigned
-    # Look west
-    difm = numpy.roll( ocidm, 1, axis=1) - ocidm
-    cst_nrst_ocn_id[ difm>0 ] = numpy.roll( cst_nrst_ocn_id, 1, axis=1)[ difm>0 ]
-    ocidm[ cst_nrst_ocn_id>=0 ] = 1 # Flag all that have been assigned
-    # Look south
-    difm = numpy.roll( ocidm, 1, axis=0) - ocidm
-    difm[0,:] = 0 # Non-periodic across south
-    cst_nrst_ocn_id[ difm>0 ] = numpy.roll( cst_nrst_ocn_id, 1, axis=0)[ difm>0 ]
-    ocidm[ cst_nrst_ocn_id>=0 ] = 1 # Flag all that have been assigned
-    # Look north
-    difm = numpy.roll( ocidm, -1, axis=0) - ocidm
-    difm[-1,:] = 0 # *********************** THIS DOES NOT DO THE TRI-POLAR FOLD PROPERLY YET ***************
-    cst_nrst_ocn_id[ difm>0 ] = numpy.roll( cst_nrst_ocn_id, -1, axis=0)[ difm>0 ]
-    ocidm[ cst_nrst_ocn_id>=0 ] = 1 # Flag all that have been assigned
-  return cst_nrst_ocn_id
-
-class kdtree:
-  @jit
-  def __init__(self, lat, lon, level=0, i0=None, i1=None, j0=None, j1=None):
-    """Contructs a k-d tree for a mesh with nodes at (lon,lat)."""
-    self.level = level
-    if level==0:
-      j0, j1 = 0, lon.shape[0]
-      i0, i1 = 0, lon.shape[1]
-    self.j0, self.j1 = j0, j1
-    self.i0, self.i1 = i0, i1
-    nj, ni = j1-j0-1, i1-i0-1
-    if (nj,ni)==(1,1):
-      self.end = True
-      self.xmin, self.xmax = lon[j0:j1,i0:i1].min(), lon[j0:j1,i0:i1].max()
-      self.ymin, self.ymax = lat[j0:j1,i0:i1].min(), lat[j0:j1,i0:i1].max()
-      self.lat, self.lon = lat[j0:j1,i0:i1], lon[j0:j1,i0:i1]
-    else:
-      self.end = False
-      pj, pi = kdtree.first_divisor(nj), kdtree.first_divisor(ni)
-      rj, ri = nj//pj, ni//pi # Size of the sub-array for this level
-      self.leaves = list()
-      xmin, xmax, ymin, ymax = lon[j0,i0], lon[j0,i0], lat[j0,i0], lat[j0,i0]
-      for jj in range(pj):
-        di = list()
-        jj0, jj1 = j0+jj*rj, j0+(jj+1)*rj+1
-        for ii in range(pi):
-          ii0, ii1 = i0+ii*ri, i0+(ii+1)*ri+1
-          q = kdtree( lat, lon, level=level+1, i0=ii0, i1=ii1, j0=jj0, j1=jj1)
-          di.append( q )
-          xmin, xmax = min(xmin, q.xmin), max(xmax, q.xmax)
-          ymin, ymax = min(ymin, q.ymin), max(ymax, q.ymax)
-        self.leaves.append(di)
-      self.xmin, self.xmax = xmin, xmax
-      self.ymin, self.ymax = ymin, ymax
-  @jit
-  def first_divisor(n):
-    """Returns the smallest, non-unity divisor of n."""
-    for d in range(2,n//2+1):
-      if n%d==0: return d
-    return n
-  @jit
-  def sign_of_loc_p_on_ab(a_lon, a_lat, b_lon, b_lat, p_lon, p_lat):
-    """Returns positive real if P to the right of AB, negative if to the left, and zero if P is on AB
-    or AB has zero length."""
-    return ( a_lat - p_lat) * ( b_lon - a_lon ) - ( a_lon - p_lon ) * ( b_lat - a_lat )
-  def inside(left, right, val):
-    if val>=left and val<right: return True
-    return False
-  def id2s(self):
-    return ' '*self.level + '%i:%i-%i,%i-%i'%(self.level,self.j0,self.j1,self.i0,self.i1)
-  #@jit
-  def find_cell(self, lat, lon):
-    # First bounding box to reject (to minimize cost)
-    if lat<self.ymin:
-      return None, None
-    if lat>=self.ymax:
-      return None, None
-    if self.level>1: # This avoids false rejects when the level is for the whole grid
-      if (((lon-self.xmin)+180) % 360)<180:
-        return None, None
-      #if lon<self.xmin: return False, None, None
-      if (((lon-self.xmax)+180) % 360)>=180:
-        return None, None
-      #if lon>=self.xmax: return False, None, None
-    if self.end:
-      if kdtree.sign_of_loc_p_on_ab( self.lon[0,0], self.lat[0,0], self.lon[0,1], self.lat[0,1], lon, lat ) > 0:
-        return None, None
-      if kdtree.sign_of_loc_p_on_ab( self.lon[1,0], self.lat[1,0], self.lon[0,0], self.lat[0,0], lon, lat ) > 0:
-        return None, None
-      if kdtree.sign_of_loc_p_on_ab( self.lon[0,1], self.lat[0,1], self.lon[1,1], self.lat[1,1], lon, lat ) >= 0:
-        return None, None
-      if kdtree.sign_of_loc_p_on_ab( self.lon[1,1], self.lat[1,1], self.lon[1,0], self.lat[1,0], lon, lat ) >= 0:
-        return None, None
-      return self.j0, self.i0
-    else:
-      res, j, i = False, None, None
-      for jl in self.leaves:
-        for il in jl:
-          this_j, this_i = il.find_cell(lat, lon)
-          if this_j is not None:
-            if res: raise Exception('Two positive results!')
-            res = True
-            j, i = this_j, this_i
-      if self.level>0:
-        return j, i
-    return j,i
-
-def brute_force_search_for_ocn_ij( ocn_lat, ocn_lon, lat, lon):
-  cost = numpy.abs( ocn_lat - lat) + numpy.abs( numpy.mod(ocn_lon - lon + 180, 360) - 180 )
-  return numpy.argmin( cost )
 
 def regrid_runoff( old_file, var_name, A, new_file_name, ocn_area, ocn_mask, ocn_qlat, ocn_qlon, ocn_lat, ocn_lon, rvr_area, fms_attr, fmst_attr, num_records , toler=1e-15, compress=False):
   """Regrids runoff data using sparse matrix A and write new file"""
